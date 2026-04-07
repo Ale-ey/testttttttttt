@@ -3,6 +3,9 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Behind ngrok / a reverse proxy so req.ip and secure cookies behave correctly when deployed.
+app.set("trust proxy", 1);
+
 const MAX_HISTORY = 100;
 const webhookHistory = [];
 /** @type {Set<import("http").ServerResponse>} */
@@ -47,6 +50,14 @@ app.post("/webhook/regiondo", (req, res) => {
     if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
     broadcastToBrowsers(payload);
   });
+});
+
+// Some dashboards probe the URL with GET/HEAD before saving; Regiondo may still require POST for real events.
+app.get("/webhook/regiondo", (_req, res) => {
+  res.status(200).type("text/plain").send("ok");
+});
+app.head("/webhook/regiondo", (_req, res) => {
+  res.status(200).end();
 });
 
 /** Live stream of webhooks to the browser (EventSource). */
