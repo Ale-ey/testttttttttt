@@ -33,18 +33,20 @@ app.post("/webhook/regiondo", (req, res) => {
     body: req.body,
   };
 
-  console.log("\n========== Regiondo webhook ==========");
-  console.log("Time:", receivedAt);
-  console.log("Headers:", JSON.stringify(req.headers, null, 2));
-  console.log("Body:", JSON.stringify(req.body, null, 2));
-  console.log("======================================\n");
-
-  webhookHistory.push(payload);
-  if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
-  broadcastToBrowsers(payload);
-
-  // Acknowledge quickly so Regiondo does not retry
+  // Respond immediately so Regiondo gets 200 OK before any other work (logging, SSE, etc.).
   res.status(200).json({ ok: true, receivedAt });
+
+  setImmediate(() => {
+    console.log("\n========== Regiondo webhook ==========");
+    console.log("Time:", receivedAt);
+    console.log("Headers:", JSON.stringify(req.headers, null, 2));
+    console.log("Body:", JSON.stringify(req.body, null, 2));
+    console.log("======================================\n");
+
+    webhookHistory.push(payload);
+    if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
+    broadcastToBrowsers(payload);
+  });
 });
 
 /** Live stream of webhooks to the browser (EventSource). */
