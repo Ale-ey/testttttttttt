@@ -88,14 +88,39 @@ function normalizeBookingKey(body) {
   return String(raw ?? "").trim();
 }
 
+/** Regiondo / proxies may send JSON as a string or wrap fields under `body`. */
+function normalizeRegiondoBody(raw) {
+  if (raw == null) return {};
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof obj !== "object" || Array.isArray(obj)) return {};
+  let merged = { ...obj };
+  if (obj.body != null && typeof obj.body === "object" && !Array.isArray(obj.body)) {
+    merged = { ...merged, ...obj.body };
+  }
+  if (obj.data != null && typeof obj.data === "object" && !Array.isArray(obj.data)) {
+    merged = { ...merged, ...obj.data };
+  }
+  return merged;
+}
+
 function getEffectiveQty(body) {
-  const qty = Math.max(0, toInt(body?.qty, 0));
+  const rawQty = body?.qty ?? body?.quantity;
+  const qty = Math.max(0, toInt(rawQty, 0));
   const qtyCancelled = Math.max(0, toInt(body?.qty_cancelled, 0));
   return Math.max(0, qty - qtyCancelled);
 }
 
 function isOccupyingSeat(body) {
-  const status = String(body?.status ?? "").toLowerCase();
+  const status = String(body?.status ?? "")
+    .trim()
+    .toLowerCase();
   if (CANCELLED_STATUSES.has(status)) return false;
   return getEffectiveQty(body) > 0;
 }
@@ -121,7 +146,7 @@ function buildFingerprint(body) {
     booking_key: body?.booking_key ?? null,
     status: body?.status ?? null,
     payment_status: body?.payment_status ?? null,
-    qty: body?.qty ?? null,
+    qty: body?.qty ?? body?.quantity ?? null,
     qty_cancelled: body?.qty_cancelled ?? null,
     ticket_codes: body?.ticket_codes ?? null,
     event_date_time: body?.event_date_time ?? null,
@@ -131,7 +156,7 @@ function buildFingerprint(body) {
 async function processWebhookToFirestore(payload) {
   if (!db) return;
 
-  const body = payload.body || {};
+  const body = normalizeRegiondoBody(payload.body);
   const bookingKey = normalizeBookingKey(body);
   if (!bookingKey) {
     console.warn("Skipping webhook write: booking_key is missing.");
@@ -166,31 +191,46 @@ async function processWebhookToFirestore(payload) {
     const currentOccupied = Math.max(0, toInt(existingEvent.occupied, 0));
     const nextOccupied = Math.max(0, currentOccupied + seatDelta);
 
-    if (seatDelta !== 0 || !eventSnap.exists) {
-      const patch = {
-        occupied: nextOccupied,
-        title: existingEvent.title ?? body.product_name ?? body.ticket_name ?? "",
-        status: existingEvent.status ?? "active",
-        regiondoId:
-          existingEvent.regiondoId ?? String(body.product_supplier_id ?? body.product_id ?? ""),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
+    console.warn(
+      "[webhook] occupancy",
+      JSON.stringify({
+        bookingKey,
+        eventDocId,
+        qty: body.qty,
+        status: body.status,
+        prevSeats,
+        nextSeats,
+        seatDelta,
+        currentOccupied,
+        nextOccupied,
+      })
+    );
 
-      const dateMatch = String(body.event_date_time ?? "").match(
-        /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/
-      );
-      if (dateMatch && !existingEvent.time) {
-        patch.time = `${dateMatch[1]}:${dateMatch[2]}`;
-      }
-      if (!existingEvent.date && body.event_date_time) {
-        const eventDate = new Date(body.event_date_time);
-        if (!Number.isNaN(eventDate.getTime())) {
-          patch.date = admin.firestore.Timestamp.fromDate(eventDate);
-        }
-      }
+    const patch = {
+      occupied: nextOccupied,
+      title: existingEvent.title ?? body.product_name ?? body.ticket_name ?? "",
+      status: existingEvent.status ?? "active",
+      regiondoId:
+        existingEvent.regiondoId ?? String(body.product_supplier_id ?? body.product_id ?? ""),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
 
-      tx.set(eventRef, patch, { merge: true });
+    const dateMatch = String(body.event_date_time ?? "").match(
+      /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/
+    );
+    if (dateMatch && !existingEvent.time) {
+      patch.time = `${dateMatch[1]}:${dateMatch[2]}`;
     }
+    if (!existingEvent.date && body.event_date_time) {
+      const eventDate = new Date(body.event_date_time);
+      if (!Number.isNaN(eventDate.getTime())) {
+        patch.date = admin.firestore.Timestamp.fromDate(eventDate);
+      }
+    }
+
+    // Always merge event so we never skip `occupied` when seatDelta logic is non-zero
+    // (previously: seatDelta===0 && event existed skipped the write entirely).
+    tx.set(eventRef, patch, { merge: true });
 
     tx.set(
       bookingRef,
@@ -199,7 +239,7 @@ async function processWebhookToFirestore(payload) {
         eventDocId,
         status: body.status ?? null,
         paymentStatus: body.payment_status ?? null,
-        qty: Math.max(0, toInt(body.qty, 0)),
+        qty: Math.max(0, toInt(body.qty ?? body.quantity, 0)),
         qtyCancelled: Math.max(0, toInt(body.qty_cancelled, 0)),
         effectiveQty: nextEffectiveQty,
         isOccupyingSeat: nextOccupying,
