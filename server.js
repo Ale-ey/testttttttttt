@@ -26,7 +26,9 @@ let webhookQueue = Promise.resolve();
 function getFirebaseCredentialsFromEnv() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
-      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      // Strip potential wrapping single quotes if the whole JSON was pasted that way
+      const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON.trim().replace(/^'|'$/g, "");
+      return JSON.parse(raw);
     } catch (err) {
       console.error("Invalid FIREBASE_SERVICE_ACCOUNT_JSON:", err.message);
     }
@@ -38,9 +40,12 @@ function getFirebaseCredentialsFromEnv() {
     process.env.FIREBASE_PRIVATE_KEY
   ) {
     return {
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+      project_id: process.env.FIREBASE_PROJECT_ID.trim().replace(/^["']|["']$/g, ""),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL.trim().replace(/^["']|["']$/g, ""),
+      private_key: process.env.FIREBASE_PRIVATE_KEY
+        .trim()
+        .replace(/^["']|["']$/g, "") // Strip accidental wrapping quotes
+        .replace(/\\n/g, "\n"), // Convert literal \n to real newlines
     };
   }
 
