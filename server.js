@@ -175,20 +175,76 @@ async function processWebhookToFirestore(payload) {
     ]);
 
     const previousBooking = bookingSnap.exists ? bookingSnap.data() : null;
-    if (previousBooking?.lastFingerprint === fingerprint) {
-      return;
-    }
+    const existingEvent = eventSnap.exists ? eventSnap.data() : {};
+    const currentOccupied = Math.max(0, toInt(existingEvent.occupied, 0));
 
-    const prevSeats = previousBooking?.isOccupyingSeat
-      ? Math.max(0, toInt(previousBooking.effectiveQty, 0))
-      : 0;
     const nextEffectiveQty = getEffectiveQty(body);
     const nextOccupying = isOccupyingSeat(body);
     const nextSeats = nextOccupying ? nextEffectiveQty : 0;
-    const seatDelta = nextSeats - prevSeats;
 
-    const existingEvent = eventSnap.exists ? eventSnap.data() : {};
-    const currentOccupied = Math.max(0, toInt(existingEvent.occupied, 0));
+    const legacyPrevSeats =
+      previousBooking == null
+        ? 0
+        : previousBooking.isOccupyingSeat
+          ? Math.max(0, toInt(previousBooking.effectiveQty, 0))
+          : 0;
+
+    // Duplicate webhook: usually skip — unless we never applied seats to the event (repair).
+    const needsOccupancyRepair =
+      previousBooking?.lastFingerprint === fingerprint &&
+      previousBooking?.seatsAppliedToEvent == null &&
+      nextSeats > 0 &&
+      currentOccupied === 0 &&
+      legacyPrevSeats > 0 &&
+      legacyPrevSeats === nextSeats;
+
+    if (previousBooking?.lastFingerprint === fingerprint && !needsOccupancyRepair) {
+      return;
+    }
+
+    if (needsOccupancyRepair) {
+      console.warn(
+        "[webhook] occupancy repair: duplicate payload but event.occupied still 0; applying seats",
+        JSON.stringify({ bookingKey, eventDocId, nextSeats })
+      );
+    }
+
+    // Seats already counted on the event doc for this booking (source of truth when set).
+    const prevAppliedStored =
+      previousBooking?.seatsAppliedToEvent != null
+        ? Math.max(0, toInt(previousBooking.seatsAppliedToEvent, 0))
+        : null;
+
+    // Legacy bookings without seatsAppliedToEvent: infer from flags/qty.
+    let prevForDelta =
+      previousBooking == null
+        ? 0
+        : prevAppliedStored != null
+          ? prevAppliedStored
+          : previousBooking.isOccupyingSeat
+            ? Math.max(0, toInt(previousBooking.effectiveQty, 0))
+            : 0;
+
+    let seatDelta = nextSeats - prevForDelta;
+
+    // Recovery: legacy meta says seats were counted (prevForDelta === nextSeats) but event.occupied
+    // is still 0 — e.g. older code / desync. Apply seats once when the event total is still zero.
+    if (
+      seatDelta === 0 &&
+      nextSeats > 0 &&
+      previousBooking &&
+      currentOccupied === 0 &&
+      prevAppliedStored == null &&
+      prevForDelta > 0 &&
+      prevForDelta === nextSeats
+    ) {
+      seatDelta = nextSeats;
+      console.warn(
+        "[webhook] occupancy recovery: event.occupied was 0 but booking implied applied seats; re-applying delta",
+        JSON.stringify({ bookingKey, eventDocId, nextSeats })
+      );
+    }
+
     const nextOccupied = Math.max(0, currentOccupied + seatDelta);
 
     console.warn(
@@ -198,7 +254,8 @@ async function processWebhookToFirestore(payload) {
         eventDocId,
         qty: body.qty,
         status: body.status,
-        prevSeats,
+        prevForDelta,
+        prevAppliedStored,
         nextSeats,
         seatDelta,
         currentOccupied,
@@ -243,6 +300,7 @@ async function processWebhookToFirestore(payload) {
         qtyCancelled: Math.max(0, toInt(body.qty_cancelled, 0)),
         effectiveQty: nextEffectiveQty,
         isOccupyingSeat: nextOccupying,
+        seatsAppliedToEvent: nextSeats,
         seatDeltaApplied: seatDelta,
         orderId: body.order_id ?? null,
         productId: body.product_id ?? null,
