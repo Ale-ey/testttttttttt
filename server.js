@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 3000;
 app.set("trust proxy", 1);
 
 const MAX_HISTORY = 100;
+const MAX_STEP_LOG = 500;
 const webhookHistory = [];
+/** @type {Array<{ at: string; category: string; step: string; detail: unknown }>} */
+const webhookStepLog = [];
 /** @type {Set<import("http").ServerResponse>} */
 const sseClients = new Set();
 let webhookQueue = Promise.resolve();
@@ -91,6 +94,7 @@ function webhookDebugEnabled() {
 }
 
 function logFs(step, detail) {
+  pushUiLog("firestore", step, detail);
   if (!webhookDebugEnabled()) return;
   if (detail !== undefined) {
     console.log(`[webhook→firestore] ${step}`, detail);
@@ -101,6 +105,37 @@ function logFs(step, detail) {
 
 function broadcastToBrowsers(payload) {
   const line = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(line);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+/** Push a processing step to memory + all SSE clients (named event `webhookstep`). */
+function pushUiLog(category, step, detail) {
+  const entry = {
+    at: new Date().toISOString(),
+    category,
+    step,
+    detail: detail === undefined ? null : detail,
+  };
+  webhookStepLog.push(entry);
+  if (webhookStepLog.length > MAX_STEP_LOG) webhookStepLog.shift();
+  let payload;
+  try {
+    payload = JSON.stringify(entry);
+  } catch {
+    payload = JSON.stringify({
+      at: entry.at,
+      category,
+      step,
+      detail: "[unserializable]",
+    });
+  }
+  const line = `event: webhookstep\ndata: ${payload}\n\n`;
   for (const res of sseClients) {
     try {
       res.write(line);
@@ -188,6 +223,9 @@ function buildFingerprint(body) {
 async function processWebhookToFirestore(payload) {
   logFs("01 start", { hasDb: Boolean(db) });
   if (!db) {
+    pushUiLog("firestore", "ABORT: Firestore not initialized", {
+      hint: "Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_PROJECT_ID + CLIENT_EMAIL + PRIVATE_KEY",
+    });
     console.warn("[webhook→firestore] ABORT: Firestore not initialized (check Admin env vars).");
     return;
   }
@@ -203,6 +241,7 @@ async function processWebhookToFirestore(payload) {
 
   const bookingKey = normalizeBookingKey(body);
   if (!bookingKey) {
+    pushUiLog("firestore", "ABORT: booking_key missing", { bodyKeys: Object.keys(body || {}) });
     console.warn("[webhook→firestore] ABORT: booking_key missing after normalize.");
     return;
   }
@@ -315,6 +354,10 @@ async function processWebhookToFirestore(payload) {
       });
       logFs("08 tx: COMMIT OK", { bookingKey, eventDocId });
     } catch (err) {
+    pushUiLog("firestore", "TRANSACTION FAILED", {
+      message: err?.message || String(err),
+      code: err?.code,
+    });
     console.error("[webhook→firestore] TRANSACTION FAILED:", err?.message || err);
     if (err?.code) console.error("[webhook→firestore] error.code:", err.code);
     console.error(err);
@@ -329,6 +372,10 @@ function enqueueWebhookProcessing(payload) {
       logFs("queue: done");
     })
     .catch((err) => {
+      pushUiLog("queue", "handler FAILED", {
+        message: err?.message || String(err),
+        code: err?.code,
+      });
       console.error("[webhook→firestore] queue handler failed:", err?.message || err);
       console.error(err);
     });
@@ -360,6 +407,11 @@ app.post("/webhook/regiondo", (req, res) => {
     console.log(
       "[webhook→firestore] 00 after 200 OK → setImmediate: will enqueue Firestore (see [webhook→firestore] steps)"
     );
+    pushUiLog("webhook", "00 POST received → 200 OK, enqueue worker", {
+      receivedAt,
+      booking_key: payload.body?.booking_key,
+      status: payload.body?.status,
+    });
 
     webhookHistory.push(payload);
     if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
@@ -397,6 +449,11 @@ app.get("/api/webhooks", (_req, res) => {
   res.json({ events: webhookHistory });
 });
 
+/** Recent processing steps for the debug UI (webhook + Firestore + queue). */
+app.get("/api/steps", (_req, res) => {
+  res.json({ steps: webhookStepLog });
+});
+
 app.get("/health", (_req, res) => {
   res.status(200).json({
     status: "ok",
@@ -416,9 +473,29 @@ app.get("/", (_req, res) => {
   <title>Regiondo webhook log</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
-    body { margin: 0; padding: 1rem 1.25rem; max-width: 960px; }
+    body { margin: 0; padding: 1rem 1.25rem; max-width: 1100px; }
     h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 0.5rem; }
+    h2 { font-size: 0.95rem; font-weight: 600; margin: 1.25rem 0 0.5rem; color: #c4d0dc; }
     p.hint { color: #8b98a5; font-size: 0.875rem; margin: 0 0 1rem; }
+    #steps {
+      background: #0a1628;
+      color: #7dd3fc;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 120px;
+      max-height: 45vh;
+      overflow: auto;
+      border: 1px solid #1e3a5f;
+    }
+    #steps .row { border-bottom: 1px solid #1a2f45; padding: 0.35rem 0; }
+    #steps .row:last-child { border-bottom: none; }
+    #steps .meta { color: #94a3b8; font-size: 10px; }
+    #steps .cat { color: #fbbf24; font-weight: 600; }
     #log {
       background: #000;
       color: #d1f7c4;
@@ -429,21 +506,89 @@ app.get("/", (_req, res) => {
       border-radius: 8px;
       white-space: pre-wrap;
       word-break: break-word;
-      min-height: 200px;
-      max-height: 70vh;
+      min-height: 160px;
+      max-height: 40vh;
       overflow: auto;
       border: 1px solid #2f3336;
     }
     .empty { color: #71767b; }
+    .toolbar { margin: 0.5rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+    .toolbar button {
+      background: #2f3336;
+      color: #e7e9ea;
+      border: 1px solid #536471;
+      border-radius: 6px;
+      padding: 0.25rem 0.6rem;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .toolbar button:hover { background: #3d4246; }
   </style>
 </head>
 <body>
-  <h1>Regiondo webhooks</h1>
-  <p class="hint">Open DevTools (F12) → <strong>Console</strong> to see each payload logged with <code>console.log</code>. This page also lists events below.</p>
+  <h1>Regiondo webhook debugger</h1>
+  <p class="hint">Processing steps (queue + Firestore) update live. Raw payloads below. Set <code>WEBHOOK_DEBUG=0</code> on the server to hide terminal logs only — the UI still receives steps.</p>
+
+  <h2>Processing steps (booking save &amp; occupancy)</h2>
+  <div class="toolbar">
+    <button type="button" id="clearSteps">Clear step panel</button>
+    <span class="hint" style="margin:0">Uses SSE event <code>webhookstep</code> + <code>GET /api/steps</code></span>
+  </div>
+  <div id="steps" class="empty">Loading steps…</div>
+
+  <h2>Raw webhook payloads</h2>
   <div id="log" class="empty">Waiting for webhooks…</div>
   <script>
     const el = document.getElementById("log");
+    const stepsEl = document.getElementById("steps");
     let count = 0;
+    let stepCount = 0;
+
+    function appendStep(entry) {
+      stepCount += 1;
+      if (stepsEl.classList.contains("empty")) {
+        stepsEl.classList.remove("empty");
+        stepsEl.textContent = "";
+      }
+      const detail =
+        entry.detail != null && typeof entry.detail === "object"
+          ? JSON.stringify(entry.detail, null, 2)
+          : String(entry.detail ?? "");
+      const line =
+        "[" + stepCount + "] " +
+        entry.at +
+        " \\n  " +
+        entry.category +
+        " → " +
+        entry.step +
+        (detail ? "\\n  " + detail : "") +
+        "\\n\\n";
+      stepsEl.textContent += line;
+      stepsEl.scrollTop = stepsEl.scrollHeight;
+    }
+
+    document.getElementById("clearSteps").addEventListener("click", () => {
+      stepCount = 0;
+      stepsEl.textContent = "";
+      stepsEl.classList.add("empty");
+      stepsEl.textContent = "Cleared. New steps will appear below.";
+    });
+
+    fetch("/api/steps")
+      .then((r) => r.json())
+      .then(({ steps }) => {
+        if (!steps || steps.length === 0) {
+          stepsEl.classList.remove("empty");
+          stepsEl.textContent = "No steps yet. Send a POST to /webhook/regiondo.";
+          return;
+        }
+        stepsEl.classList.remove("empty");
+        stepsEl.textContent = "";
+        steps.forEach(appendStep);
+      })
+      .catch(() => {
+        stepsEl.textContent = "Could not load /api/steps";
+      });
 
     function appendEvent(data) {
       count += 1;
@@ -466,6 +611,13 @@ app.get("/", (_req, res) => {
       .catch(() => {});
 
     const es = new EventSource("/stream");
+    es.addEventListener("webhookstep", (e) => {
+      try {
+        appendStep(JSON.parse(e.data));
+      } catch (err) {
+        console.error("webhookstep parse", err);
+      }
+    });
     es.onmessage = (e) => {
       try {
         appendEvent(JSON.parse(e.data));
