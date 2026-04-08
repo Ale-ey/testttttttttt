@@ -70,13 +70,17 @@ function initFirestore() {
 const db = initFirestore();
 
 function getFirebaseProjectId() {
+  let raw = null;
   try {
-    const id = admin.app()?.options?.projectId;
-    if (id) return id;
+    raw = admin.app()?.options?.projectId;
   } catch {
     /* no app */
   }
-  return process.env.FIREBASE_PROJECT_ID || process.env.GCLOUD_PROJECT || null;
+  if (!raw) raw = process.env.FIREBASE_PROJECT_ID || process.env.GCLOUD_PROJECT || null;
+  if (raw == null) return null;
+  // .env sometimes has FIREBASE_PROJECT_ID="my-id" — strip accidental quotes
+  const s = String(raw).trim().replace(/^["']|["']$/g, "");
+  return s || null;
 }
 
 const CANCELLED_STATUSES = new Set([
@@ -87,6 +91,14 @@ const CANCELLED_STATUSES = new Set([
   "rejected_by_supplier",
   "expired",
 ]);
+
+/** Firestore write: only after `approved` (register seats), or on cancel/refund (release seats). Skips `booked`, `sent`, etc. */
+function shouldSyncBookingToFirestore(body) {
+  const s = String(body?.status ?? "").trim().toLowerCase();
+  if (s === "approved") return true;
+  if (CANCELLED_STATUSES.has(s)) return true;
+  return false;
+}
 
 /** Set WEBHOOK_DEBUG=0 to silence Firestore step logs in production. */
 function webhookDebugEnabled() {
@@ -246,6 +258,15 @@ async function processWebhookToFirestore(payload) {
     return;
   }
 
+  if (!shouldSyncBookingToFirestore(body)) {
+    logFs("SKIP: not approved yet (no Firestore write)", {
+      bookingKey,
+      status: body?.status,
+      note: "Sync runs only for status approved, or cancelled/refunded/rejected/expired to release seats.",
+    });
+    return;
+  }
+
   const eventDocId = eventDocIdFromPayload(body);
   const fingerprint = buildFingerprint(body);
 
@@ -366,9 +387,9 @@ async function processWebhookToFirestore(payload) {
         "IAM: In Google Cloud → IAM, open the service account from your Admin JSON and add role Cloud Datastore User (or Editor) for project " +
         (getFirebaseProjectId() || "your Firebase project") +
         ". Ensure the key's project_id matches this project.";
+      const pid = getFirebaseProjectId() || "";
       detail.iamUrl =
-        "https://console.cloud.google.com/iam-admin/iam?project=" +
-        encodeURIComponent(getFirebaseProjectId() || "");
+        "https://console.cloud.google.com/iam-admin/iam?project=" + encodeURIComponent(pid);
     }
     pushUiLog("firestore", "TRANSACTION FAILED", detail);
     console.error("[webhook→firestore] TRANSACTION FAILED:", err?.message || err);
@@ -559,7 +580,10 @@ app.get("/", (_req, res) => {
 
     function appendStep(entry) {
       stepCount += 1;
-      if (stepsEl.classList.contains("empty")) {
+      const placeholder =
+        stepsEl.textContent.includes("No steps yet") ||
+        stepsEl.textContent.includes("Loading steps");
+      if (stepsEl.classList.contains("empty") || placeholder) {
         stepsEl.classList.remove("empty");
         stepsEl.textContent = "";
       }
@@ -591,7 +615,7 @@ app.get("/", (_req, res) => {
       .then((r) => r.json())
       .then(({ steps }) => {
         if (!steps || steps.length === 0) {
-          stepsEl.classList.remove("empty");
+          stepsEl.classList.add("empty");
           stepsEl.textContent = "No steps yet. Send a POST to /webhook/regiondo.";
           return;
         }
