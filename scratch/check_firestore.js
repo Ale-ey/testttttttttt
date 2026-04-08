@@ -40,11 +40,17 @@ admin.initializeApp({
 const db = admin.firestore();
 
 async function checkEvent() {
-  const APP_PATH = "apps/mozarthaus_new_buchungssystem_mozarthaus_v1";
+  const APP_DOC = "mozarthaus_new_buchungssystem_mozarthaus_v1";
   const eventId = "regiondo_product_23941";
-  console.log(`Checking Event: ${APP_PATH}/events/${eventId}`);
+  const path = `apps/${APP_DOC}/events/${eventId}`;
+  console.log(`Checking Event: ${path}`);
 
-  const snap = await db.collection(`${APP_PATH}/events`).doc(eventId).get();
+  const snap = await db
+    .collection("apps")
+    .doc(APP_DOC)
+    .collection("events")
+    .doc(eventId)
+    .get();
   if (snap.exists) {
     console.log(JSON.stringify(snap.data(), null, 2));
   } else {

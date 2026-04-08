@@ -248,10 +248,12 @@ async function processWebhookToFirestore(payload) {
 
   const eventDocId = eventDocIdFromPayload(body);
   const fingerprint = buildFingerprint(body);
-  
-  const APP_PATH = "apps/mozarthaus_new_buchungssystem_mozarthaus_v1";
-  const bookingRef = db.collection(`${APP_PATH}/bookings`).doc(bookingKey);
-  const eventRef = db.collection(`${APP_PATH}/events`).doc(eventDocId);
+
+  // Firestore path: /apps/{appDoc}/bookings/{bookingKey} and /apps/{appDoc}/events/{eventDocId}
+  const MOZARTHAUS_APP_DOC = "mozarthaus_new_buchungssystem_mozarthaus_v1";
+  const appRoot = db.collection("apps").doc(MOZARTHAUS_APP_DOC);
+  const bookingRef = appRoot.collection("bookings").doc(bookingKey);
+  const eventRef = appRoot.collection("events").doc(eventDocId);
 
   logFs("03 targets", {
     bookingPath: bookingRef.path,
@@ -354,10 +356,21 @@ async function processWebhookToFirestore(payload) {
       });
       logFs("08 tx: COMMIT OK", { bookingKey, eventDocId });
     } catch (err) {
-    pushUiLog("firestore", "TRANSACTION FAILED", {
+    const code = err?.code;
+    const detail = {
       message: err?.message || String(err),
-      code: err?.code,
-    });
+      code,
+    };
+    if (code === 7 || String(err?.message || "").includes("PERMISSION_DENIED")) {
+      detail.hint =
+        "IAM: In Google Cloud → IAM, open the service account from your Admin JSON and add role Cloud Datastore User (or Editor) for project " +
+        (getFirebaseProjectId() || "your Firebase project") +
+        ". Ensure the key's project_id matches this project.";
+      detail.iamUrl =
+        "https://console.cloud.google.com/iam-admin/iam?project=" +
+        encodeURIComponent(getFirebaseProjectId() || "");
+    }
+    pushUiLog("firestore", "TRANSACTION FAILED", detail);
     console.error("[webhook→firestore] TRANSACTION FAILED:", err?.message || err);
     if (err?.code) console.error("[webhook→firestore] error.code:", err.code);
     console.error(err);
