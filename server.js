@@ -400,7 +400,7 @@ async function processWebhookToFirestore(payload) {
 
 function enqueueWebhookProcessing(payload) {
   logFs("queue: enqueue");
-  webhookQueue = webhookQueue
+  const p = webhookQueue
     .then(async () => {
       await processWebhookToFirestore(payload);
       logFs("queue: done");
@@ -413,6 +413,8 @@ function enqueueWebhookProcessing(payload) {
       console.error("[webhook→firestore] queue handler failed:", err?.message || err);
       console.error(err);
     });
+  webhookQueue = p;
+  return p;
 }
 
 // Parse JSON bodies (Regiondo typically sends application/json)
@@ -421,7 +423,7 @@ app.use(express.json({ limit: "2mb" }));
 // Optional: parse urlencoded if Regiondo ever uses form posts
 app.use(express.urlencoded({ extended: true }));
 
-app.post("/webhook/regiondo", (req, res) => {
+app.post("/webhook/regiondo", async (req, res) => {
   const receivedAt = new Date().toISOString();
   const payload = {
     receivedAt,
@@ -429,29 +431,35 @@ app.post("/webhook/regiondo", (req, res) => {
     body: req.body,
   };
 
-  // Respond immediately so Regiondo gets 200 OK before any other work (logging, SSE, etc.).
-  res.status(200).json({ ok: true, receivedAt });
+  console.log("\n========== Regiondo webhook ==========");
+  console.log("Time:", receivedAt);
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("======================================\n");
 
-  setImmediate(() => {
-    console.log("\n========== Regiondo webhook ==========");
-    console.log("Time:", receivedAt);
-    console.log("Headers:", JSON.stringify(req.headers, null, 2));
-    console.log("Body:", JSON.stringify(req.body, null, 2));
-    console.log("======================================\n");
-    console.log(
-      "[webhook→firestore] 00 after 200 OK → setImmediate: will enqueue Firestore (see [webhook→firestore] steps)"
-    );
-    pushUiLog("webhook", "00 POST received → 200 OK, enqueue worker", {
-      receivedAt,
-      booking_key: payload.body?.booking_key,
-      status: payload.body?.status,
-    });
-
-    webhookHistory.push(payload);
-    if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
-    broadcastToBrowsers(payload);
-    enqueueWebhookProcessing(payload);
+  pushUiLog("webhook", "00 POST received, starting processing...", {
+    receivedAt,
+    booking_key: payload.body?.booking_key,
+    status: payload.body?.status,
   });
+
+  webhookHistory.push(payload);
+  if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
+  broadcastToBrowsers(payload);
+
+  try {
+    // We MUST await this on Vercel, otherwise the function may be terminated
+    // before the Firestore write completes.
+    await enqueueWebhookProcessing(payload);
+    
+    console.log("[webhook→firestore] Done processing. Sending 200 OK.");
+    res.status(200).json({ ok: true, receivedAt, processed: true });
+  } catch (err) {
+    console.error("[webhook→firestore] Critical failure during processing:", err);
+    // Still sending 200 OK to Regiondo to avoid retries if we reached this point,
+    // but indicating an error in the response body.
+    res.status(200).json({ ok: false, receivedAt, error: err.message });
+  }
 });
 
 // Some dashboards probe the URL with GET/HEAD before saving; Regiondo may still require POST for real events.
