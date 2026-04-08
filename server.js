@@ -1,4 +1,12 @@
+const fs = require("node:fs");
+const path = require("node:path");
 const express = require("express");
+const admin = require("firebase-admin");
+
+const dotenvPath = path.join(__dirname, ".env.local");
+if (fs.existsSync(dotenvPath)) {
+  require("dotenv").config({ path: dotenvPath });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,6 +18,54 @@ const MAX_HISTORY = 100;
 const webhookHistory = [];
 /** @type {Set<import("http").ServerResponse>} */
 const sseClients = new Set();
+let webhookQueue = Promise.resolve();
+
+function getFirebaseCredentialsFromEnv() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+      console.error("Invalid FIREBASE_SERVICE_ACCOUNT_JSON:", err.message);
+    }
+  }
+
+  if (
+    process.env.FIREBASE_PROJECT_ID &&
+    process.env.FIREBASE_CLIENT_EMAIL &&
+    process.env.FIREBASE_PRIVATE_KEY
+  ) {
+    return {
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    };
+  }
+
+  return null;
+}
+
+function initFirestore() {
+  try {
+    if (!admin.apps.length) {
+      const creds = getFirebaseCredentialsFromEnv();
+      if (creds) {
+        admin.initializeApp({ credential: admin.credential.cert(creds) });
+      } else {
+        console.warn(
+          "Firebase credentials missing. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY."
+        );
+        return null;
+      }
+    }
+    return admin.firestore();
+  } catch (err) {
+    console.error("Failed to initialize Firebase Admin:", err);
+    return null;
+  }
+}
+
+const db = initFirestore();
+const CANCELLED_STATUSES = new Set(["cancelled", "canceled", "refunded"]);
 
 function broadcastToBrowsers(payload) {
   const line = `data: ${JSON.stringify(payload)}\n\n`;
@@ -20,6 +76,157 @@ function broadcastToBrowsers(payload) {
       sseClients.delete(res);
     }
   }
+}
+
+function toInt(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+function normalizeBookingKey(body) {
+  const raw = body?.booking_key ?? body?.order_id;
+  return String(raw ?? "").trim();
+}
+
+function getEffectiveQty(body) {
+  const qty = Math.max(0, toInt(body?.qty, 0));
+  const qtyCancelled = Math.max(0, toInt(body?.qty_cancelled, 0));
+  return Math.max(0, qty - qtyCancelled);
+}
+
+function isOccupyingSeat(body) {
+  const status = String(body?.status ?? "").toLowerCase();
+  if (CANCELLED_STATUSES.has(status)) return false;
+  return getEffectiveQty(body) > 0;
+}
+
+function normalizeTitle(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function eventDocIdFromPayload(body) {
+  const title = normalizeTitle(body?.product_name || body?.ticket_name || "event");
+  const dateValue = String(body?.event_date_time ?? "");
+  const match = dateValue.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!match) return `${title}_unknown`;
+  const [, year, month, day, hour, minute] = match;
+  return `${title}_${year}_${month}_${day}_${hour}_${minute}`;
+}
+
+function buildFingerprint(body) {
+  return JSON.stringify({
+    booking_key: body?.booking_key ?? null,
+    status: body?.status ?? null,
+    payment_status: body?.payment_status ?? null,
+    qty: body?.qty ?? null,
+    qty_cancelled: body?.qty_cancelled ?? null,
+    ticket_codes: body?.ticket_codes ?? null,
+    event_date_time: body?.event_date_time ?? null,
+  });
+}
+
+async function processWebhookToFirestore(payload) {
+  if (!db) return;
+
+  const body = payload.body || {};
+  const bookingKey = normalizeBookingKey(body);
+  if (!bookingKey) {
+    console.warn("Skipping webhook write: booking_key is missing.");
+    return;
+  }
+
+  const eventDocId = eventDocIdFromPayload(body);
+  const fingerprint = buildFingerprint(body);
+  const bookingRef = db.collection("bookings").doc(bookingKey);
+  const eventRef = db.collection("events").doc(eventDocId);
+
+  await db.runTransaction(async (tx) => {
+    const [bookingSnap, eventSnap] = await Promise.all([
+      tx.get(bookingRef),
+      tx.get(eventRef),
+    ]);
+
+    const previousBooking = bookingSnap.exists ? bookingSnap.data() : null;
+    if (previousBooking?.lastFingerprint === fingerprint) {
+      return;
+    }
+
+    const prevSeats = previousBooking?.isOccupyingSeat
+      ? Math.max(0, toInt(previousBooking.effectiveQty, 0))
+      : 0;
+    const nextEffectiveQty = getEffectiveQty(body);
+    const nextOccupying = isOccupyingSeat(body);
+    const nextSeats = nextOccupying ? nextEffectiveQty : 0;
+    const seatDelta = nextSeats - prevSeats;
+
+    const existingEvent = eventSnap.exists ? eventSnap.data() : {};
+    const currentOccupied = Math.max(0, toInt(existingEvent.occupied, 0));
+    const nextOccupied = Math.max(0, currentOccupied + seatDelta);
+
+    if (seatDelta !== 0 || !eventSnap.exists) {
+      const patch = {
+        occupied: nextOccupied,
+        title: existingEvent.title ?? body.product_name ?? body.ticket_name ?? "",
+        status: existingEvent.status ?? "active",
+        regiondoId:
+          existingEvent.regiondoId ?? String(body.product_supplier_id ?? body.product_id ?? ""),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      const dateMatch = String(body.event_date_time ?? "").match(
+        /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/
+      );
+      if (dateMatch && !existingEvent.time) {
+        patch.time = `${dateMatch[1]}:${dateMatch[2]}`;
+      }
+      if (!existingEvent.date && body.event_date_time) {
+        const eventDate = new Date(body.event_date_time);
+        if (!Number.isNaN(eventDate.getTime())) {
+          patch.date = admin.firestore.Timestamp.fromDate(eventDate);
+        }
+      }
+
+      tx.set(eventRef, patch, { merge: true });
+    }
+
+    tx.set(
+      bookingRef,
+      {
+        bookingKey,
+        eventDocId,
+        status: body.status ?? null,
+        paymentStatus: body.payment_status ?? null,
+        qty: Math.max(0, toInt(body.qty, 0)),
+        qtyCancelled: Math.max(0, toInt(body.qty_cancelled, 0)),
+        effectiveQty: nextEffectiveQty,
+        isOccupyingSeat: nextOccupying,
+        seatDeltaApplied: seatDelta,
+        orderId: body.order_id ?? null,
+        productId: body.product_id ?? null,
+        eventDateTime: body.event_date_time ?? null,
+        lastFingerprint: fingerprint,
+        lastReceivedAt: payload.receivedAt,
+        lastPayload: body,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt:
+          previousBooking?.createdAt ?? admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function enqueueWebhookProcessing(payload) {
+  webhookQueue = webhookQueue
+    .then(async () => {
+      await processWebhookToFirestore(payload);
+    })
+    .catch((err) => {
+      console.error("Queued webhook processing failed:", err);
+    });
 }
 
 // Parse JSON bodies (Regiondo typically sends application/json)
@@ -49,6 +256,7 @@ app.post("/webhook/regiondo", (req, res) => {
     webhookHistory.push(payload);
     if (webhookHistory.length > MAX_HISTORY) webhookHistory.shift();
     broadcastToBrowsers(payload);
+    enqueueWebhookProcessing(payload);
   });
 });
 
@@ -84,6 +292,7 @@ app.get("/api/webhooks", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.status(200).json({
     status: "ok",
+    firestore: Boolean(db),
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   });
@@ -164,6 +373,7 @@ const server = app.listen(PORT, () => {
   console.log(`Browser log: http://localhost:${PORT}/`);
   console.log(`Webhook URL: http://localhost:${PORT}/webhook/regiondo`);
   console.log(`Health:      http://localhost:${PORT}/health`);
+  console.log(`Firestore:   ${db ? "enabled" : "disabled (missing credentials)"}`);
 });
 
 server.on("error", (err) => {
