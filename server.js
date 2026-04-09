@@ -97,10 +97,10 @@ const CANCELLED_STATUSES = new Set([
   "expired",
 ]);
 
-/** Firestore write: only after `approved` (register seats), or on cancel/refund (release seats). Skips `booked`, `sent`, etc. */
+/** Firestore write: after `approved` or `sent` (register seats), or on cancel/refund (release seats). Skips `booked`, etc. */
 function shouldSyncBookingToFirestore(body) {
   const s = String(body?.status ?? "").trim().toLowerCase();
-  if (s === "approved") return true;
+  if (s === "approved" || s === "sent") return true;
   if (CANCELLED_STATUSES.has(s)) return true;
   return false;
 }
@@ -264,10 +264,10 @@ async function processWebhookToFirestore(payload) {
   }
 
   if (!shouldSyncBookingToFirestore(body)) {
-    logFs("SKIP: not approved yet (no Firestore write)", {
+    logFs("SKIP: intermediate status (no Firestore write)", {
       bookingKey,
       status: body?.status,
-      note: "Sync runs only for status approved, or cancelled/refunded/rejected/expired to release seats.",
+      note: "Sync runs for approved or sent (register seats), or cancelled/refunded/rejected/expired to release seats.",
     });
     return;
   }
