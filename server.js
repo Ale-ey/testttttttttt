@@ -237,6 +237,38 @@ function buildFingerprint(body) {
   });
 }
 
+function getSeatingTemplate() {
+  const seating = {};
+  const generateRow = (rowId, count) => {
+    const category = ["A", "B", "C"].includes(rowId) ? "A" : "B";
+    for (let i = 1; i <= count; i++) {
+      const id = `row_${rowId.toLowerCase()}_seat_${i}`;
+      seating[id] = {
+        bookingId: null,
+        category,
+        row: rowId,
+        number: i,
+      };
+    }
+  };
+
+  generateRow("A", 13);
+  generateRow("B", 13);
+  generateRow("C", 13);
+  generateRow("D", 11);
+  generateRow("E", 11);
+  [1, 2, 3, 4, 5, 6].forEach((num) => {
+    seating[`row_f_seat_${num}`] = {
+      bookingId: null,
+      category: "B",
+      row: "F",
+      number: num,
+    };
+  });
+
+  return seating;
+}
+
 async function processWebhookToFirestore(payload) {
   logFs("01 start", { hasDb: Boolean(db) });
   if (!db) {
@@ -275,7 +307,6 @@ async function processWebhookToFirestore(payload) {
   const eventDocId = eventDocIdFromPayload(body);
   const fingerprint = buildFingerprint(body);
 
-  // Firestore path: /apps/{appDoc}/bookings/{bookingKey} and /apps/{appDoc}/events/{eventDocId}
   const MOZARTHAUS_APP_DOC = "mozarthaus_new_buchungssystem_mozarthaus_v1";
   const appRoot = db.collection("apps").doc(MOZARTHAUS_APP_DOC);
   const bookingRef = appRoot.collection("bookings").doc(bookingKey);
@@ -287,101 +318,125 @@ async function processWebhookToFirestore(payload) {
     fingerprintPreview: fingerprint.slice(0, 80) + (fingerprint.length > 80 ? "…" : ""),
   });
 
-    try {
-      await db.runTransaction(async (tx) => {
-        const [bookingSnap, eventSnap] = await Promise.all([
-          tx.get(bookingRef),
-          tx.get(eventRef),
-        ]);
+  try {
+    const isCancelled = CANCELLED_STATUSES.has(String(body.status).toLowerCase());
 
-        logFs("04 tx: fetched booking + event", {
-          bookingKey,
-          bookingExists: bookingSnap.exists,
-          eventExists: eventSnap.exists,
-        });
+    await db.runTransaction(async (tx) => {
+      const [bookingSnap, eventSnap] = await Promise.all([tx.get(bookingRef), tx.get(eventRef)]);
 
-        const previousBooking = bookingSnap.exists ? bookingSnap.data() : null;
-        const existingEvent = eventSnap.exists ? eventSnap.data() : {};
-        const currentOccupied = Math.max(0, toInt(existingEvent.occupied, 0));
-
-        const nextEffectiveQty = getEffectiveQty(body);
-        const nextOccupying = isOccupyingSeat(body);
-        const nextSeats = nextOccupying ? nextEffectiveQty : 0;
-
-        // Determine how many seats were previously counted towards the event capacity.
-        // We use `seatsAppliedToEvent` as the explicit source of truth.
-        const prevApplied =
-          previousBooking != null
-            ? Math.max(0, toInt(previousBooking.seatsAppliedToEvent, 0))
-            : 0;
-
-        // If the payload matches the last processed one exactly, skip (unless repair is needed).
-        if (
-          previousBooking?.lastFingerprint === fingerprint &&
-          currentOccupied > 0 &&
-          prevApplied === nextSeats
-        ) {
-          logFs("05 tx SKIP (duplicate fingerprint)", { bookingKey });
-          return;
-        }
-
-        const seatDelta = nextSeats - prevApplied;
-        const nextOccupied = Math.max(0, currentOccupied + seatDelta);
-
-        logFs("06 tx: result", {
-          status: body.status,
-          nextSeats,
-          prevApplied,
-          seatDelta,
-          nextOccupied,
-        });
-
-        const patch = {
-          occupied: nextOccupied,
-          title: existingEvent.title ?? body.product_name ?? body.ticket_name ?? "",
-          status: existingEvent.status ?? "active",
-          regiondoId:
-            existingEvent.regiondoId ?? String(body.product_supplier_id ?? body.product_id ?? ""),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        const dateMatch = String(body.event_date_time ?? "").match(
-          /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/
-        );
-        if (dateMatch && !existingEvent.time) {
-          patch.time = `${dateMatch[1]}:${dateMatch[2]}`;
-        }
-        if (!existingEvent.date && body.event_date_time) {
-          const eventDate = new Date(body.event_date_time);
-          if (!Number.isNaN(eventDate.getTime())) {
-            patch.date = admin.firestore.Timestamp.fromDate(eventDate);
-          }
-        }
-
-        tx.set(eventRef, patch, { merge: true });
-
-        tx.set(
-          bookingRef,
-          {
-            bookingKey,
-            eventDocId,
-            status: body.status ?? null,
-            effectiveQty: nextEffectiveQty,
-            isOccupyingSeat: nextOccupying,
-            seatsAppliedToEvent: nextSeats,
-            seatDeltaApplied: seatDelta,
-            lastFingerprint: fingerprint,
-            lastReceivedAt: payload.receivedAt,
-            lastPayload: body,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            createdAt:
-              previousBooking?.createdAt ?? admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
+      logFs("04 tx: fetched states", {
+        bookingKey,
+        bookingExists: bookingSnap.exists,
+        eventExists: eventSnap.exists,
+        isCancelled,
       });
-      logFs("08 tx: COMMIT OK", { bookingKey, eventDocId });
-    } catch (err) {
+
+      const previousBooking = bookingSnap.exists ? bookingSnap.data() : null;
+      let seating = eventSnap.exists ? eventSnap.data().seating || {} : getSeatingTemplate();
+
+      // Skip duplicate fingerprint if seat counts would match
+      if (previousBooking?.lastFingerprint === fingerprint && !isCancelled) {
+        logFs("05 tx SKIP (duplicate fingerprint)", { bookingKey });
+        return;
+      }
+
+      let assignedSeatIds = previousBooking?.seatIds || [];
+
+      if (isCancelled) {
+        // --- CANCELLATION FLOW ---
+        pushUiLog("firestore", "Processing Cancellation", { bookingKey, seatsToRelease: assignedSeatIds.length });
+        
+        if (assignedSeatIds.length > 0) {
+          assignedSeatIds.forEach((sid) => {
+            if (seating[sid] && seating[sid].bookingId === bookingKey) {
+              seating[sid].bookingId = null;
+            }
+          });
+          logFs("Cancellation: seats cleared in event map", { released: assignedSeatIds });
+        }
+        assignedSeatIds = []; // Clear in booking as well
+      } else {
+        // --- REGISTRATION FLOW ---
+        const variation = (body?.variation_name || body?.ticket_name || "").toLowerCase();
+        let targetCat = "B";
+        if (variation.includes("category a") || variation.includes("kategorie a")) targetCat = "A";
+        else if (variation.includes("student")) targetCat = "STUDENT";
+
+        pushUiLog("firestore", "Detected Category", { variation, targetCat });
+
+        // Auto-assign logic
+        const searchCat = targetCat === "STUDENT" ? "B" : targetCat;
+        const requestedQty = getEffectiveQty(body);
+        const currentQty = assignedSeatIds.length;
+
+        if (requestedQty !== currentQty) {
+          pushUiLog("firestore", "Re-calculating seats", { requested: requestedQty, current: currentQty });
+          
+          // First, release any existing seats if this is an update
+          assignedSeatIds.forEach((sid) => {
+            if (seating[sid]) seating[sid].bookingId = null;
+          });
+
+          const availableSeats = Object.keys(seating).filter(
+            (id) => seating[id].category === searchCat && seating[id].bookingId === null
+          );
+
+          assignedSeatIds = [];
+          for (let i = 0; i < Math.min(requestedQty, availableSeats.length); i++) {
+            const sid = availableSeats[i];
+            seating[sid].bookingId = bookingKey;
+            assignedSeatIds.push(sid);
+          }
+          
+          pushUiLog("firestore", "Mapped seats", { count: assignedSeatIds.length, seats: assignedSeatIds });
+        }
+      }
+
+      // Update Event
+      const eventPatch = {
+        seating,
+        title: eventSnap.exists ? eventSnap.data().title : body.product_name || body.ticket_name || "",
+        status: eventSnap.exists ? eventSnap.data().status : "active",
+        regiondoId: eventSnap.exists 
+          ? eventSnap.data().regiondoId 
+          : String(body.product_supplier_id ?? body.product_id ?? ""),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      const dateMatch = String(body.event_date_time ?? "").match(/^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/);
+      if (dateMatch && (!eventSnap.exists || !eventSnap.data().time)) {
+        eventPatch.time = `${dateMatch[1]}:${dateMatch[2]}`;
+      }
+      if (body.event_date_time && (!eventSnap.exists || !eventSnap.data().date)) {
+        const eventDate = new Date(body.event_date_time);
+        if (!Number.isNaN(eventDate.getTime())) {
+          eventPatch.date = admin.firestore.Timestamp.fromDate(eventDate);
+        }
+      }
+
+      tx.set(eventRef, eventPatch, { merge: true });
+
+      // Update Booking
+      tx.set(
+        bookingRef,
+        {
+          bookingKey,
+          eventDocId,
+          status: body.status ?? null,
+          effectiveQty: getEffectiveQty(body),
+          isOccupyingSeat: !isCancelled && assignedSeatIds.length > 0,
+          seatIds: assignedSeatIds,
+          lastFingerprint: fingerprint,
+          lastReceivedAt: payload.receivedAt,
+          lastPayload: body,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: previousBooking?.createdAt ?? admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    });
+    logFs("08 tx: COMMIT OK", { bookingKey, eventDocId });
+  } catch (err) {
     const code = err?.code;
     const detail = {
       message: err?.message || String(err),
