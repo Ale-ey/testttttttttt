@@ -365,7 +365,6 @@ async function processWebhookToFirestore(payload) {
         pushUiLog("firestore", "Detected Category", { variation, targetCat });
 
         // Auto-assign logic
-        const searchCat = targetCat === "STUDENT" ? "B" : targetCat;
         const requestedQty = getEffectiveQty(body);
         const currentQty = assignedSeatIds.length;
 
@@ -377,9 +376,17 @@ async function processWebhookToFirestore(payload) {
             if (seating[sid]) seating[sid].bookingId = null;
           });
 
-          const availableSeats = Object.keys(seating).filter(
-            (id) => seating[id].category === searchCat && seating[id].bookingId === null
-          );
+          let availableSeats = [];
+          if (targetCat === "STUDENT") {
+            // Students prefer Cat B (Rows D-F) but can sit in Cat A (Rows A-C) if needed
+            const catB = Object.keys(seating).filter(id => seating[id].category === "B" && seating[id].bookingId === null);
+            const catA = Object.keys(seating).filter(id => seating[id].category === "A" && seating[id].bookingId === null);
+            availableSeats = [...catB, ...catA];
+          } else {
+            availableSeats = Object.keys(seating).filter(id => 
+              seating[id].category === targetCat && seating[id].bookingId === null
+            );
+          }
 
           assignedSeatIds = [];
           for (let i = 0; i < Math.min(requestedQty, availableSeats.length); i++) {
