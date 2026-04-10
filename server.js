@@ -350,6 +350,8 @@ async function processWebhookToFirestore(payload) {
           assignedSeatIds.forEach((sid) => {
             if (seating[sid] && seating[sid].bookingId === bookingKey) {
               seating[sid].bookingId = null;
+              // Restore original category
+              seating[sid].category = (["A", "B", "C"].includes(seating[sid].row) ? "A" : "B");
             }
           });
           logFs("Cancellation: seats cleared in event map", { released: assignedSeatIds });
@@ -373,7 +375,11 @@ async function processWebhookToFirestore(payload) {
           
           // First, release any existing seats if this is an update
           assignedSeatIds.forEach((sid) => {
-            if (seating[sid]) seating[sid].bookingId = null;
+            if (seating[sid]) {
+              seating[sid].bookingId = null;
+              // Restore original category
+              seating[sid].category = (["A", "B", "C"].includes(seating[sid].row) ? "A" : "B");
+            }
           });
 
           let availableSeats = [];
@@ -392,6 +398,9 @@ async function processWebhookToFirestore(payload) {
           for (let i = 0; i < Math.min(requestedQty, availableSeats.length); i++) {
             const sid = availableSeats[i];
             seating[sid].bookingId = bookingKey;
+            if (targetCat === "STUDENT") {
+              seating[sid].category = "STUDENT";
+            }
             assignedSeatIds.push(sid);
           }
           
